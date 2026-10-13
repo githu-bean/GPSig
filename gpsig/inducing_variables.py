@@ -2,28 +2,38 @@ import numpy as np
 import tensorflow as tf
 import gpflow
 
-from gpflow import settings, transforms
-from gpflow.features import InducingPointsBase, InducingFeature, Kuu, Kuf
-from gpflow.dispatch import dispatch
-from gpflow.decors import params_as_tensors, params_as_tensors_for, autoflow
-from gpflow.params import Parameter, ParamList
-from gpflow.kernels import Kernel, Combination, Sum, Product
+from gpflow import Parameter
+from gpflow.config import default_float
+from gpflow.covariances import Kuu, Kuf
+from gpflow.inducing_variables import InducingVariables
+from gpflow.utilities import Dispatcher
 
 from .kernels import SignatureKernel
 
-class SignatureInducing(InducingPointsBase):
+# computes Kzz, Kzx and Kxx (or its diagonal) jointly, which avoids recomputing shared terms in the signature kernel
+Kuu_Kuf_Kff = Dispatcher('Kuu_Kuf_Kff')
+
+class SignatureInducing(InducingVariables):
     """
     Base class for inducing variables for use with signature kernel in sparse variational GPs.
     # Input
     :Z:             Array of locations of inducing variables
     :num_levels:    The same as the num_levels argument in SignatureKernel
-    :learn_weights: True or False, if True, an additional linear combination layer is added to the inducing variables, separately on each tensor algebra level 
+    :learn_weights: True or False, if True, an additional linear combination layer is added to the inducing variables, separately on each tensor algebra level
     """
-    def __init__(self, Z, num_levels, learn_weights=False):
-        super().__init__(Z)
+    def __init__(self, Z, num_levels, learn_weights=False, name=None):
+        super().__init__(name=name)
+        self.Z = Parameter(Z, dtype=default_float())
         self.learn_weights = learn_weights
         if learn_weights:
-            self.W = Parameter(np.tile(np.eye(self.__len__())[None, ...], [num_levels, 1, 1]), dtype=settings.float_type)
+            self.W = Parameter(np.tile(np.eye(self.num_inducing)[None, ...], [num_levels, 1, 1]), dtype=default_float())
+
+    def __len__(self):
+        return self.num_inducing
+
+    @property
+    def shape(self):
+        return tuple(self.Z.shape)
 
 class InducingTensors(SignatureInducing):
     """
@@ -41,49 +51,48 @@ class InducingTensors(SignatureInducing):
         if increments:
             assert Z.ndim == 4
             assert Z.shape[2] == 2
+        self._num_inducing = Z.shape[1]
         super().__init__(Z, num_levels, **kwargs)
         self.len_tensors = len_tensors
         self.increments = increments
 
-    def __len__(self):
-        return self.Z.shape[1]
+    @property
+    def num_inducing(self):
+        return self._num_inducing
 
-@dispatch(InducingTensors, SignatureKernel, object)
-def Kuu_Kuf_Kff(feat, kern, X_new, *, jitter=0.0, full_f_cov=False):
-    with params_as_tensors_for(feat):
-        if feat.learn_weights:
-            Kzz, Kzx, Kxx = kern.K_tens_n_seq_covs(feat.Z, X_new, full_X_cov=full_f_cov, return_levels=True, increments=feat.increments)
-            Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
-            Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
-            Kxx = tf.reduce_sum(Kxx, axis=0)
-        else:
-            Kzz, Kzx, Kxx = kern.K_tens_n_seq_covs(feat.Z, X_new, full_X_cov=full_f_cov, increments=feat.increments)
-        Kzz += jitter * tf.eye(len(feat), dtype=settings.dtypes.float_type)
-        if full_f_cov:
-            Kxx += jitter * tf.eye(tf.shape(X)[0], dtype=settings.dtypes.float_type)
-        else:
-            Kxx += jitter
+@Kuu_Kuf_Kff.register(InducingTensors, SignatureKernel, object)
+def _Kuu_Kuf_Kff_tensors(feat, kern, X_new, *, jitter=0.0, full_f_cov=False):
+    if feat.learn_weights:
+        Kzz, Kzx, Kxx = kern.K_tens_n_seq_covs(feat.Z, X_new, full_X_cov=full_f_cov, return_levels=True, increments=feat.increments)
+        Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
+        Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
+        Kxx = tf.reduce_sum(Kxx, axis=0)
+    else:
+        Kzz, Kzx, Kxx = kern.K_tens_n_seq_covs(feat.Z, X_new, full_X_cov=full_f_cov, increments=feat.increments)
+    Kzz += jitter * tf.eye(len(feat), dtype=default_float())
+    if full_f_cov:
+        Kxx += jitter * tf.eye(tf.shape(X_new)[0], dtype=default_float())
+    else:
+        Kxx += jitter
     return Kzz, Kzx, Kxx
 
-@dispatch(InducingTensors, SignatureKernel, object)
-def Kuf(feat, kern, X_new):
-    with params_as_tensors_for(feat):
-        if feat.learn_weights:
-            Kzx = kern.K_tens_vs_seq(feat.Z, X_new, return_levels=True, increments=feat.increments)
-            Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
-        else:
-            Kzx = kern.K_tens_vs_seq(feat.Z, X_new, increments=feat.increments)
+@Kuf.register(InducingTensors, SignatureKernel, object)
+def _Kuf_tensors(feat, kern, X_new):
+    if feat.learn_weights:
+        Kzx = kern.K_tens_vs_seq(feat.Z, X_new, return_levels=True, increments=feat.increments)
+        Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
+    else:
+        Kzx = kern.K_tens_vs_seq(feat.Z, X_new, increments=feat.increments)
     return Kzx
 
-@dispatch(InducingTensors, SignatureKernel)
-def Kuu(feat, kern, *, jitter=0.0, full_f_cov=False):
-    with params_as_tensors_for(feat):
-        if feat.learn_weights:
-            Kzz = kern.K_tens(feat.Z, return_levels=True, increments=feat.increments)
-            Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
-        else:
-            Kzz = kern.K_tens(feat.Z, increments=feat.increments)
-        Kzz += jitter * tf.eye(len(feat), dtype=settings.dtypes.float_type)
+@Kuu.register(InducingTensors, SignatureKernel)
+def _Kuu_tensors(feat, kern, *, jitter=0.0, full_f_cov=False):
+    if feat.learn_weights:
+        Kzz = kern.K_tens(feat.Z, return_levels=True, increments=feat.increments)
+        Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
+    else:
+        Kzz = kern.K_tens(feat.Z, increments=feat.increments)
+    Kzz += jitter * tf.eye(len(feat), dtype=default_float())
     return Kzz
 
 class InducingSequences(SignatureInducing):
@@ -94,44 +103,46 @@ class InducingSequences(SignatureInducing):
     :num_levels:    The same as the num_levels argument in the SignatureKernel
     """
     def __init__(self, Z, num_levels, **kwargs):
+        self._num_inducing = Z.shape[0]
         super().__init__(Z, num_levels, **kwargs)
         self.len_inducing = Z.shape[1]
-        
 
-@dispatch(InducingSequences, SignatureKernel)
-def Kuu(feat, kern, *, jitter=0.0):
-    with params_as_tensors_for(feat):
-        if feat.learn_weights:
-            Kzz = kern.K(feat.Z, return_levels=True, presliced=True)
-            Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
-        else:
-            Kzz = kern.K(feat.Z, presliced=True)
-        Kzz += jitter * tf.eye(len(feat), dtype=settings.dtypes.float_type)
+    @property
+    def num_inducing(self):
+        return self._num_inducing
+
+
+@Kuu.register(InducingSequences, SignatureKernel)
+def _Kuu_sequences(feat, kern, *, jitter=0.0):
+    if feat.learn_weights:
+        Kzz = kern.K(feat.Z, return_levels=True, presliced=True)
+        Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
+    else:
+        Kzz = kern.K(feat.Z, presliced=True)
+    Kzz += jitter * tf.eye(len(feat), dtype=default_float())
     return Kzz
 
-@dispatch(InducingSequences, SignatureKernel, object)
-def Kuf(feat, kern, X_new):
-    with params_as_tensors_for(feat):
-        if feat.learn_weights:
-            Kzx = kern.K(feat.Z, X_new, presliced_X=True, return_levels=True)
-            Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
-        else:
-            Kzx = kern.K(feat.Z, X_new, presliced_X=True)
+@Kuf.register(InducingSequences, SignatureKernel, object)
+def _Kuf_sequences(feat, kern, X_new):
+    if feat.learn_weights:
+        Kzx = kern.K(feat.Z, X_new, presliced_X=True, return_levels=True)
+        Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
+    else:
+        Kzx = kern.K(feat.Z, X_new, presliced_X=True)
     return Kzx
 
-@dispatch(InducingSequences, SignatureKernel, object)
-def Kuu_Kuf_Kff(feat, kern, X_new, *, jitter=0.0, full_f_cov=False):
-    with params_as_tensors_for(feat):
-        if feat.learn_weights:
-            Kzz, Kzx, Kxx = kern.K_seq_n_seq_covs(feat.Z, X_new, full_X2_cov=full_f_cov, return_levels=True)
-            Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
-            Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
-            Kxx = tf.reduce_sum(Kxx, axis=0)
-        else:
-            Kzz, Kzx, Kxx = kern.K_seq_n_seq_covs(feat.Z, X_new, full_X2_cov=full_f_cov)
-        Kzz += jitter * tf.eye(len(feat), dtype=settings.dtypes.float_type)
-        if full_f_cov:
-            Kxx += jitter * tf.eye(tf.shape(X)[0], dtype=settings.dtypes.float_type)
-        else:
-            Kxx += jitter
+@Kuu_Kuf_Kff.register(InducingSequences, SignatureKernel, object)
+def _Kuu_Kuf_Kff_sequences(feat, kern, X_new, *, jitter=0.0, full_f_cov=False):
+    if feat.learn_weights:
+        Kzz, Kzx, Kxx = kern.K_seq_n_seq_covs(feat.Z, X_new, full_X2_cov=full_f_cov, return_levels=True)
+        Kzz = Kzz[0] + tf.reduce_sum(tf.matmul(tf.matmul(feat.W, Kzz[1:]), feat.W, transpose_b=True), axis=0)
+        Kzx = Kzx[0] + tf.reduce_sum(tf.matmul(feat.W, Kzx[1:]), axis=0)
+        Kxx = tf.reduce_sum(Kxx, axis=0)
+    else:
+        Kzz, Kzx, Kxx = kern.K_seq_n_seq_covs(feat.Z, X_new, full_X2_cov=full_f_cov)
+    Kzz += jitter * tf.eye(len(feat), dtype=default_float())
+    if full_f_cov:
+        Kxx += jitter * tf.eye(tf.shape(X_new)[0], dtype=default_float())
+    else:
+        Kxx += jitter
     return Kzz, Kzx, Kxx

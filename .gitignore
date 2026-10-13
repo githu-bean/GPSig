@@ -1,2 +1,5 @@
 .ipynb_checkpoints
 *.pyc
+__pycache__/
+notebooks/Libras/
+notebooks/Libras.zip

@@ -1,16 +1,29 @@
 
+import functools
+
 import tensorflow as tf
+import tensorflow_probability as tfp
 import numpy as np
 
-from gpflow.params import Parameter
-from gpflow.decors import params_as_tensors, params_as_tensors_for, autoflow
-from gpflow import transforms
-from gpflow import settings
+import gpflow
+from gpflow import Parameter
+from gpflow.config import default_float, default_int, default_jitter
 from gpflow.kernels import Kernel
+from gpflow.utilities import positive
 
 from . import lags
 from . import low_rank_calculations
 from . import signature_algs
+
+def _autoflow(method):
+    """
+    Replacement for the GPflow 1 @autoflow decorator: converts numpy inputs to tensors and returns numpy outputs.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args):
+        args = [tf.convert_to_tensor(arg, dtype=default_float()) for arg in args]
+        return tf.nest.map_structure(lambda t: t.numpy(), method(self, *args))
+    return wrapper
 
 class SignatureKernel(Kernel):
     """
@@ -50,7 +63,10 @@ class SignatureKernel(Kernel):
                             - 'lin' - approximately O(n) non-zero entries;
         """
         
-        super().__init__(input_dim, active_dims, name=name)
+        if active_dims is None:
+            active_dims = slice(0, input_dim)
+        super().__init__(active_dims=active_dims, name=name)
+        self.input_dim = input_dim
         self.num_features = num_features
         self.num_levels = num_levels
         self.len_examples = self._validate_number_of_features(input_dim, num_features)
@@ -62,8 +78,8 @@ class SignatureKernel(Kernel):
         self.normalization = normalization
         self.difference = difference
 
-        self.variances = Parameter(self._validate_signature_param("variances", variances, num_levels + 1), transform=transforms.positive, dtype=settings.float_type)
-        self.sigma = Parameter(1., transform=transforms.positive, dtype=settings.float_type)
+        self.variances = Parameter(self._validate_signature_param("variances", variances, num_levels + 1), transform=positive(), dtype=default_float())
+        self.sigma = Parameter(1., transform=positive(), dtype=default_float())
 
         self.low_rank, self.num_components, self.rank_bound, self.sparsity = self._validate_low_rank_params(low_rank, num_components, rank_bound, sparsity)
 
@@ -76,16 +92,33 @@ class SignatureKernel(Kernel):
             else:
                 self.num_lags = int(num_lags)
                 if num_lags > 0:
-                    self.lags = Parameter(0.1 * np.asarray(range(1, num_lags+1)), transform=transforms.Logistic(), dtype=settings.float_type)
+                    self.lags = Parameter(0.1 * np.asarray(range(1, num_lags+1)), transform=tfp.bijectors.Sigmoid(), dtype=default_float())
                     gamma = 1. / np.asarray(range(1, self.num_lags+2))
                     gamma /= np.sum(gamma)                   
-                    self.gamma = Parameter(gamma, transform=transforms.positive, dtype=settings.float_type)
+                    self.gamma = Parameter(gamma, transform=positive(), dtype=default_float())
 
         if lengthscales is not None:
             lengthscales = self._validate_signature_param("lengthscales", lengthscales, self.num_features)
-            self.lengthscales = Parameter(lengthscales, transform=transforms.positive, dtype=settings.float_type)
+            self.lengthscales = Parameter(lengthscales, transform=positive(), dtype=default_float())
         else:
             self.lengthscales = None
+
+    def __call__(self, X, X2=None, *, full_cov=True, presliced=False):
+        """
+        GPflow 2 entry point; slicing is handled inside K and Kdiag (as in GPflow 1), so it is not repeated here.
+        """
+        if not full_cov:
+            return self.Kdiag(X, presliced=presliced)
+        return self.K(X, X2, presliced=presliced)
+
+    def K_diag(self, X):
+        return self.Kdiag(X, presliced=True)
+
+    def set_trainable(self, trainable):
+        """
+        Sets all hyperparameters of the kernel (non-)trainable, as in GPflow 1.
+        """
+        gpflow.set_trainable(self, trainable)
 
 	######################
 	## Input validators ##
@@ -109,6 +142,10 @@ class SignatureKernel(Kernel):
         if low_rank is not None and low_rank == True:
             if not type(low_rank) == bool:
                 raise ValueError("Unknown low-rank argument: %s. It should be True of False." % low_rank)
+            # the low-rank code below is kept, but known to be incorrect (see the README), so its use is disabled
+            raise NotImplementedError('The low-rank mode is disabled, since its implementation (inherited from the original code) is known to be incorrect: '
+                                      'the low-rank features of levels >= 2 are computed from the wrong factor, and lengthscales/lags are ignored by K. '
+                                      'Use low_rank=False.')
             if sparsity not in ['log', 'sqrt', 'lin']:
                 raise ValueError("Unknown sparsity argument %s. Possible values are 'sqrt', 'log', 'lin'" % sparsity)
             if rank_bound is not None and rank_bound <= 0:
@@ -126,7 +163,7 @@ class SignatureKernel(Kernel):
         """
         Validates signature params
         """
-        value = value * np.ones(length, dtype=settings.float_type)
+        value = value * np.ones(length, dtype=default_float())
         correct_shape = () if length==1 else (length,)
         if np.asarray(value).squeeze().shape != correct_shape:
             raise ValueError("shape of parameter {} is not what is expected ({})".format(name, length))
@@ -138,16 +175,15 @@ class SignatureKernel(Kernel):
     ########################################
 
 
-    @autoflow((settings.float_type, [None, None]),
-              (settings.float_type, [None, None]))
+    @_autoflow
     def compute_K(self, X, Y):
         return self.K(X, Y)
 
-    @autoflow((settings.float_type, [None, None]))
+    @_autoflow
     def compute_K_symm(self, X):
         return self.K(X)
 
-    @autoflow((settings.float_type, [None, None]))
+    @_autoflow
     def compute_base_kern_symm(self, X):
         num_examples = tf.shape(X)[0]
         X = tf.reshape(X, (num_examples, -1, self.num_features))
@@ -156,32 +192,31 @@ class SignatureKernel(Kernel):
         M = tf.transpose(tf.reshape(self._base_kern(X), [num_examples, len_examples, num_examples, len_examples]), [0, 2, 1, 3])
         return M
 
-    @autoflow((settings.float_type, [None, None]))
+    @_autoflow
     def compute_K_level_diags(self, X):
         return self.Kdiag(X, return_levels=True)
 
-    @autoflow((settings.float_type, [None, None]),
-              (settings.float_type, [None, None]))
+    @_autoflow
     def compute_K_levels(self, X, X2):
         return self.K(X, X2, return_levels=True)
     
-    @autoflow((settings.float_type, [None, None]))
+    @_autoflow
     def compute_Kdiag(self, X):
         return self.Kdiag(X)
 
-    @autoflow((settings.float_type, ))
+    @_autoflow
     def compute_K_tens(self, Z):
         return self.K_tens(Z, return_levels=False)
 
-    @autoflow((settings.float_type,), (settings.float_type, [None, None]))
+    @_autoflow
     def compute_K_tens_vs_seq(self, Z, X): 
         return self.K_tens_vs_seq(Z, X, return_levels=False)
     
-    @autoflow((settings.float_type, ))
+    @_autoflow
     def compute_K_incr_tens(self, Z):
         return self.K_tens(Z, increments=True, return_levels=False)
 
-    @autoflow((settings.float_type,), (settings.float_type, [None, None]))
+    @_autoflow
     def compute_K_incr_tens_vs_seq(self, Z, X): 
         return self.K_tens_vs_seq(Z, X, increments=True, return_levels=False)
 
@@ -339,7 +374,6 @@ class SignatureKernel(Kernel):
         
         return K_lvls
 
-    @params_as_tensors
     def _apply_scaling_and_lags_to_sequences(self, X):
         """
         Applies scaling and lags to sequences.
@@ -363,7 +397,6 @@ class SignatureKernel(Kernel):
         X = tf.reshape(X, (num_examples, len_examples, num_features))
         return X
 
-    @params_as_tensors
     def _apply_scaling_to_tensors(self, Z):
         """
         Applies scaling to simple tensors of shape (num_levels*(num_levels+1)/2, num_tensors, num_features*(num_lags+1))
@@ -380,7 +413,6 @@ class SignatureKernel(Kernel):
 
         return Z
     
-    @params_as_tensors
     def _apply_scaling_to_incremental_tensors(self, Z):
         """
         Applies scaling to incremental tensors of shape (num_levels*(num_levels+1)/2, num_tensors, 2, num_features*(num_lags+1))
@@ -397,7 +429,6 @@ class SignatureKernel(Kernel):
         Z = tf.reshape(Z, (len_tensors, num_tensors, 2, num_features))
         return Z
             
-    @params_as_tensors
     def K(self, X, X2 = None, presliced = False, return_levels = False, presliced_X = False, presliced_X2 = False):
         """
         Computes signature kernel between sequences
@@ -408,11 +439,11 @@ class SignatureKernel(Kernel):
             presliced_X2 = True
 
         if not presliced_X and not presliced_X2:
-            X, X2 = self._slice(X, X2)
+            X, X2 = self.slice(X, X2)
         elif not presliced_X:
-            X, _ = self._slice(X, None)
+            X, _ = self.slice(X, None)
         elif not presliced_X2 and X2 is not None:
-            X2, _ = self._slice(X2, None)
+            X2, _ = self.slice(X2, None)
 
         num_examples = tf.shape(X)[0]
         X = tf.reshape(X, [num_examples, -1, self.num_features])
@@ -428,8 +459,8 @@ class SignatureKernel(Kernel):
                 K_lvls = self._K_seq(X_scaled)
             
             if self.normalization:
-                K_lvls += settings.jitter * tf.eye(num_examples, dtype=settings.float_type)[None]
-                K_lvls_diag_sqrt = tf.sqrt(tf.matrix_diag_part(K_lvls))
+                K_lvls += default_jitter() * tf.eye(num_examples, dtype=default_float())[None]
+                K_lvls_diag_sqrt = tf.sqrt(tf.linalg.diag_part(K_lvls))
                 K_lvls /= K_lvls_diag_sqrt[:, :, None] * K_lvls_diag_sqrt[:, None, :]
 
         else:
@@ -440,7 +471,7 @@ class SignatureKernel(Kernel):
             X2_scaled = self._apply_scaling_and_lags_to_sequences(X2)
 
             if self.low_rank:
-                seeds = tf.random_uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(settings.int_type).max, dtype=settings.int_type)
+                seeds = tf.random.uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(default_int()).max, dtype=default_int())
                 idx, _ = low_rank_calculations._draw_indices(num_examples*len_examples + num_examples2*len_examples2, self.num_components)
                 
                 nys_samples = tf.gather(tf.concat((tf.reshape(X, [num_examples*len_examples, -1]), tf.reshape(X2, [num_examples2*len_examples2, -1])), axis=0), idx, axis=0)
@@ -460,8 +491,8 @@ class SignatureKernel(Kernel):
                     K1_lvls_diag = self._K_seq_diag(X_scaled)
                     K2_lvls_diag = self._K_seq_diag(X2_scaled)
                 
-                K1_lvls_diag += settings.jitter
-                K2_lvls_diag += settings.jitter
+                K1_lvls_diag += default_jitter()
+                K2_lvls_diag += default_jitter()
 
                 K1_lvls_diag_sqrt = tf.sqrt(K1_lvls_diag)
                 K2_lvls_diag_sqrt = tf.sqrt(K2_lvls_diag)
@@ -475,7 +506,6 @@ class SignatureKernel(Kernel):
         else:
             return tf.reduce_sum(K_lvls, axis=0)
 
-    @params_as_tensors
     def Kdiag(self, X, presliced=False, return_levels=False):
         """
         Computes the diagonal of a square signature kernel matrix.
@@ -490,7 +520,7 @@ class SignatureKernel(Kernel):
                 return tf.fill((num_examples,), self.sigma * tf.reduce_sum(self.variances))
                 
         if not presliced:
-            X, _ = self._slice(X, None)
+            X, _ = self.slice(X, None)
 
         X = tf.reshape(X, (num_examples, -1, self.num_features))
 
@@ -509,7 +539,6 @@ class SignatureKernel(Kernel):
         else:
             return tf.reduce_sum(K_lvls_diag, axis=0)
         
-    @params_as_tensors
     def K_tens(self, Z, return_levels=False, increments=False):
         """
         Computes a square covariance matrix of inducing tensors Z.
@@ -535,14 +564,13 @@ class SignatureKernel(Kernel):
         else:
             return tf.reduce_sum(K_lvls, axis=0)
 
-    @params_as_tensors
     def K_tens_vs_seq(self, Z, X, return_levels=False, increments=False, presliced=False):
         """
         Computes a cross-covariance matrix between inducing tensors and sequences.
         """
 
         if not presliced:
-            X, _ = self._slice(X, None)
+            X, _ = self.slice(X, None)
         
         num_examples = tf.shape(X)[0]
         X = tf.reshape(X, (num_examples, -1, self.num_features))
@@ -558,7 +586,7 @@ class SignatureKernel(Kernel):
         X = self._apply_scaling_and_lags_to_sequences(X)
 
         if self.low_rank:
-            seeds = tf.random_uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(settings.int_type).max, dtype=settings.int_type)
+            seeds = tf.random.uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(default_int()).max, dtype=default_int())
             idx, _ = low_rank_calculations._draw_indices(num_tensors*len_tensors*(int(increments)+1) + num_examples*len_examples, self.num_components)
             nys_samples = tf.gather(tf.concat((tf.reshape(Z, [num_tensors*len_tensors*(int(increments)+1), -1]), tf.reshape(X, [num_examples*len_examples, -1])), axis=0), idx, axis=0)
             
@@ -575,7 +603,7 @@ class SignatureKernel(Kernel):
             else:
                 Kxx_lvls_diag = self._K_seq_diag(X)
 
-            Kxx_lvls_diag += settings.jitter
+            Kxx_lvls_diag += default_jitter()
 
             Kxx_lvls_diag_sqrt = tf.sqrt(Kxx_lvls_diag)
             Kzx_lvls /= Kxx_lvls_diag_sqrt[:, None, :]
@@ -587,14 +615,13 @@ class SignatureKernel(Kernel):
         else:
             return tf.reduce_sum(Kzx_lvls, axis=0)
 
-    @params_as_tensors
     def K_tens_n_seq_covs(self, Z, X, full_X_cov = False, return_levels=False, increments=False, presliced=False):
         """
         Computes and returns all three relevant matrices between inducing tensors tensors and input sequences, Kzz, Kzx, Kxx. Kxx is only diagonal if not full_X_cov
         """
 
         if not presliced:
-            X, _ = self._slice(X, None)
+            X, _ = self.slice(X, None)
         
         num_examples = tf.shape(X)[0]
         X = tf.reshape(X, (num_examples, -1, self.num_features))
@@ -610,7 +637,7 @@ class SignatureKernel(Kernel):
         X = self._apply_scaling_and_lags_to_sequences(X)
 
         if self.low_rank:
-            seeds = tf.random_uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(settings.int_type).max, dtype=settings.int_type)
+            seeds = tf.random.uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(default_int()).max, dtype=default_int())
             idx, _ = low_rank_calculations._draw_indices(num_tensors*len_tensors*(int(increments)+1) + num_examples*len_examples, self.num_components)
             nys_samples = tf.gather(tf.concat((tf.reshape(Z, [num_tensors*len_tensors*(int(increments)+1), -1]), tf.reshape(X, [num_examples*len_examples, -1])), axis=0), idx, axis=0)
             
@@ -630,9 +657,9 @@ class SignatureKernel(Kernel):
                 Kxx_lvls = self._K_seq(X)
 
             if self.normalization:
-                Kxx_lvls += settings.jitter * tf.eye(num_examples, dtype=settings.float_type)[None]
+                Kxx_lvls += default_jitter() * tf.eye(num_examples, dtype=default_float())[None]
                 
-                Kxx_lvls_diag_sqrt = tf.sqrt(tf.matrix_diag_part(Kxx_lvls))
+                Kxx_lvls_diag_sqrt = tf.sqrt(tf.linalg.diag_part(Kxx_lvls))
 
                 Kxx_lvls /= Kxx_lvls_diag_sqrt[:, :, None] * Kxx_lvls_diag_sqrt[:, None, :]
                 Kzx_lvls /= Kxx_lvls_diag_sqrt[:, None, :]
@@ -653,7 +680,7 @@ class SignatureKernel(Kernel):
                 Kxx_lvls_diag = self._K_seq_diag(X)
 
             if self.normalization:
-                Kxx_lvls_diag += settings.jitter
+                Kxx_lvls_diag += default_jitter()
 
                 Kxx_lvls_diag_sqrt = tf.sqrt(Kxx_lvls_diag)
 
@@ -670,14 +697,13 @@ class SignatureKernel(Kernel):
             else:
                 return tf.reduce_sum(Kzz_lvls, axis=0), tf.reduce_sum(Kzx_lvls, axis=0), tf.reduce_sum(Kxx_lvls_diag, axis=0)
 
-    @params_as_tensors
     def K_seq_n_seq_covs(self, X, X2, full_X2_cov = False, return_levels=False, presliced=False):
         """
         Computes and returns all three relevant matrices between inducing sequences and input sequences, Kxx, Kxx2, Kx2x2. Kx2x2 is only diagonal if not full_X2_cov
         """
 
         if not presliced:
-            X2, _ = self._slice(X2, None)
+            X2, _ = self.slice(X2, None)
 
         num_examples = tf.shape(X)[0]
         X = tf.reshape(X, (num_examples, -1, self.num_features))
@@ -691,7 +717,7 @@ class SignatureKernel(Kernel):
         X2 = self._apply_scaling_and_lags_to_sequences(X2)
 
         if self.low_rank:
-            seeds = tf.random_uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(settings.int_type).max, dtype=settings.int_type)
+            seeds = tf.random.uniform((self.num_levels-1, 2), minval=0, maxval=np.iinfo(default_int()).max, dtype=default_int())
             idx, _ = low_rank_calculations._draw_indices(num_examples*len_examples + num_examples2*len_examples2, self.num_components)
             nys_samples = tf.gather(tf.concat((tf.reshape(X, [num_examples*len_examples, -1]), tf.reshape(X2, [num_examples2*len_examples2, -1])), axis=0), idx, axis=0)
             
@@ -706,9 +732,9 @@ class SignatureKernel(Kernel):
 
         if self.normalization:
             
-            Kxx_lvls += settings.jitter * tf.eye(num_examples, dtype=settings.float_type)[None]
+            Kxx_lvls += default_jitter() * tf.eye(num_examples, dtype=default_float())[None]
 
-            Kxx_lvls_diag_sqrt = tf.sqrt(tf.matrix_diag_part(Kxx_lvls))
+            Kxx_lvls_diag_sqrt = tf.sqrt(tf.linalg.diag_part(Kxx_lvls))
             Kxx_lvls /= Kxx_lvls_diag_sqrt[:, :, None] * Kxx_lvls_diag_sqrt[:, None, :]
             Kxx2_lvls /= Kxx_lvls_diag_sqrt[:, :, None]
         
@@ -720,12 +746,12 @@ class SignatureKernel(Kernel):
 
             if self.normalization:
 
-                K_x2x2_lvls += settings.jitter * tf.eye(num_examples2, dtype=settings.float_type)[None]
+                Kx2x2_lvls += default_jitter() * tf.eye(num_examples2, dtype=default_float())[None]
 
-                Kx2x2_lvls_diag_sqrt = tf.sqrt(tf.matrix_diag_part(K_x2x2_lvls)) 
+                Kx2x2_lvls_diag_sqrt = tf.sqrt(tf.linalg.diag_part(Kx2x2_lvls)) 
 
-                Kxx2_lvls /= Kx2x2_lvls_diags_sqrt[:, None, :]
-                Kx2x2_lvls /= Kx2x2_lvls_diags_sqrt[:, :, None] * Kx2x2_lvls_diags_sqrt[:, None, :]
+                Kxx2_lvls /= Kx2x2_lvls_diag_sqrt[:, None, :]
+                Kx2x2_lvls /= Kx2x2_lvls_diag_sqrt[:, :, None] * Kx2x2_lvls_diag_sqrt[:, None, :]
             
             Kxx_lvls *= self.sigma * self.variances[:, None, None]
             Kxx2_lvls *= self.sigma * self.variances[:, None, None]
@@ -743,11 +769,12 @@ class SignatureKernel(Kernel):
                 Kx2x2_lvls_diag = self._K_seq_diag(X2)
 
             if self.normalization:
-                Kx2x2_lvls_diag += settings.jitter
+                Kx2x2_lvls_diag += default_jitter()
 
                 Kx2x2_lvls_diag_sqrt = tf.sqrt(Kx2x2_lvls_diag)
                 
-                Kxx2_lvls /= Kxx_lvls_diag_sqrt[:, :, None] * Kx2x2_lvls_diag_sqrt[:, None, :]
+                # the rows were already normalized by Kxx_lvls_diag_sqrt above
+                Kxx2_lvls /= Kx2x2_lvls_diag_sqrt[:, None, :]
                 Kx2x2_lvls_diag = tf.tile(self.sigma * self.variances[:, None], [1, num_examples2])
             else:
                 Kx2x2_lvls_diag *= self.sigma * self.variances[:, None]
@@ -790,8 +817,8 @@ class SignatureLinear(SignatureKernel):
 
     def __init__(self, input_dim, num_features, num_levels, **kwargs):
         SignatureKernel.__init__(self, input_dim, num_features, num_levels, **kwargs)
-        # self.gamma = Parameter(1.0/float(self.num_features), transform=transforms.positive, dtype=settings.float_type)
-        # self.offsets = Parameter(np.zeros(self.num_features), dtype=settings.float_type)
+        # self.gamma = Parameter(1.0/float(self.num_features), transform=positive(), dtype=default_float())
+        # self.offsets = Parameter(np.zeros(self.num_features), dtype=default_float())
         self._base_kern = self._lin
     
     __init__.__doc__ = SignatureKernel.__init__.__doc__
@@ -812,7 +839,7 @@ class SignatureCosine(SignatureKernel):
 
     def __init__(self, input_dim, num_features, num_levels, **kwargs):
         SignatureKernel.__init__(self, input_dim, num_features, num_levels, **kwargs)
-        # self.gamma = Parameter(1.0, transform=transforms.positive, dtype=settings.float_type)
+        # self.gamma = Parameter(1.0, transform=positive(), dtype=default_float())
         self._base_kern = self._cos
     
     __init__.__doc__ = SignatureKernel.__init__.__doc__
@@ -834,13 +861,12 @@ class SignaturePoly(SignatureKernel):
     """
     def __init__(self, input_dim, num_features, num_levels, gamma = 1, degree = 3, **kwargs):
         SignatureKernel.__init__(self, input_dim, num_features, num_levels, **kwargs)
-        self.gamma = Parameter(gamma, transform=transforms.positive, dtype=settings.float_type)
-        self.degree = Parameter(degree, dtype=settings.float_type, trainable=False)
+        self.gamma = Parameter(gamma, transform=positive(), dtype=default_float())
+        self.degree = Parameter(degree, dtype=default_float(), trainable=False)
         self._base_kern = self._poly
     
     __init__.__doc__ = SignatureKernel.__init__.__doc__
 
-    @params_as_tensors
     def _poly(self, X, X2=None):
         if X2 is None:
             return (tf.matmul(X, X, transpose_b = True) + self.gamma) ** self.degree
@@ -853,8 +879,8 @@ class SignatureRBF(SignatureKernel):
     """
     def __init__(self, input_dim, num_features, num_levels, **kwargs):
         SignatureKernel.__init__(self, input_dim, num_features, num_levels, **kwargs)
-        # self.sigma = Parameter([1.0], transform=transforms.positive, dtype=settings.float_type)
-        # self.gamma = Parameter(1.0/float(self.num_features), transform=transforms.positive, dtype=settings.float_type)
+        # self.sigma = Parameter([1.0], transform=positive(), dtype=default_float())
+        # self.gamma = Parameter(1.0/float(self.num_features), transform=positive(), dtype=default_float())
         self._base_kern = self._rbf
     
     __init__.__doc__ = SignatureKernel.__init__.__doc__
@@ -873,7 +899,7 @@ class SignatureMix(SignatureKernel):
     """
     def __init__(self, input_dim, num_features, num_levels, **kwargs):
         SignatureKernel.__init__(self, input_dim, num_features, num_levels, **kwargs)
-        self.mixing = Parameter(0.5, transform=transforms.positive, dtype=settings.float_type)
+        self.mixing = Parameter(0.5, transform=positive(), dtype=default_float())
         self._base_kern = self._mix
     
     __init__.__doc__ = SignatureKernel.__init__.__doc__
@@ -898,6 +924,10 @@ class SignatureSpectral(SignatureKernel):
 
     def __init__(self, input_dim, num_features, num_levels, family = 'gauss', Q = 5, **kwargs):
 
+        # the implementation below is kept, but known to be broken (see the README), so its use is disabled
+        raise NotImplementedError('SignatureSpectral is disabled, since its implementation (inherited from the original code) is known to be broken: '
+                                  'the spectral base kernel only supports unbatched inputs, so most kernel computations fail.')
+
         SignatureKernel.__init__(self, input_dim, num_features, num_levels, lengthscales = None, **kwargs)
 
         if family == 'exp' or family == 'exponential':
@@ -910,14 +940,13 @@ class SignatureSpectral(SignatureKernel):
             raise ValueError("Unrecognized spectral family name.")
 
         self.Q = Q
-        self.alpha = Parameter(np.exp(np.random.randn(Q)), transform=transforms.positive, dtype=settings.float_type)
-        self.omega = Parameter(np.exp(np.random.randn(Q, self.num_features)), transform=transforms.positive, dtype=settings.float_type)
-        self.gamma = Parameter(np.exp(np.random.randn(Q, self.num_features)), transform=transforms.positive, dtype=settings.float_type)
+        self.alpha = Parameter(np.exp(np.random.randn(Q)), transform=positive(), dtype=default_float())
+        self.omega = Parameter(np.exp(np.random.randn(Q, self.num_features)), transform=positive(), dtype=default_float())
+        self.gamma = Parameter(np.exp(np.random.randn(Q, self.num_features)), transform=positive(), dtype=default_float())
         self._base_kern = self._spectral
         
     __init__.__doc__ = SignatureKernel.__init__.__doc__
 
-    @params_as_tensors
     def _spectral(self, X, X2 = None):
         if X2 is None:
             diff_tiled = tf.tile((X[None, :, None, :] - X[None, None, :, :]), [self.Q, 1, 1, 1])
@@ -929,8 +958,8 @@ class SignatureSpectral(SignatureKernel):
         elif self.family == 'rbf':
             kern_term = tf.exp(- tf.reduce_sum(tf.square(diff_tiled * self.gamma[:, None, None, :]), axis=-1) / 2)
         elif self.family == 'mixed':
-            Q1 = tf.cast(tf.floor(tf.cast(Q, settings.float_type) / 2.), settings.int_type)
-            Q2 = tf.cast(tf.ceil(tf.cast(Q, settings.float_type) / 2.), settings.int_type)
+            Q1 = tf.cast(tf.floor(tf.cast(self.Q, default_float()) / 2.), default_int())
+            Q2 = tf.cast(tf.math.ceil(tf.cast(self.Q, default_float()) / 2.), default_int())
             square_dist = - tf.reduce_sum(tf.square(diff_tiled * self.gamma[:, None, None, :]), axis=-1)
             rbf_term = tf.exp(-1.*square_dist[:Q1] / 2)
             exp_term = tf.exp( -1.*tf.sqrt(square_dist[Q1:]) / 2)
@@ -947,7 +976,7 @@ class SignatureMatern12(SignatureKernel):
     """
     def __init__(self, input_dim, num_features, num_levels, **kwargs):
         SignatureKernel.__init__(self, input_dim, num_features, num_levels, **kwargs)
-        # self.gamma = Parameter(1.0, transform=transforms.positive, dtype=settings.float_type)
+        # self.gamma = Parameter(1.0, transform=positive(), dtype=default_float())
         self._base_kern = self._Matern12
 
     __init__.__doc__ = SignatureKernel.__init__.__doc__

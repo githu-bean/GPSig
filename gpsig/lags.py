@@ -1,6 +1,6 @@
 import numpy as np
 import tensorflow as tf
-from gpflow import settings
+from gpflow.config import default_float, default_jitter
 
 
 
@@ -19,7 +19,7 @@ def lin_interp(time, X, time_query):
     
     pairwise_dist = time[:, None, None] - time_query[None, :, :]
 
-    left_idx = tf.argmax(tf.where(pairwise_dist > settings.jitter, - np.inf * tf.ones_like(pairwise_dist), pairwise_dist), axis = 0)
+    left_idx = tf.argmax(tf.where(pairwise_dist > default_jitter(), - np.inf * tf.ones_like(pairwise_dist), pairwise_dist), axis = 0)
     right_idx = left_idx + 1
 
     X_left = tf.gather(X, left_idx, axis = -2)
@@ -53,7 +53,7 @@ def add_lags_to_sequences(X, lags):
     
     num_lags = tf.shape(lags)[0]
 
-    time = tf.range(tf.cast(len_examples, settings.float_type), dtype=settings.float_type) / tf.cast(len_examples-1, settings.float_type)
+    time = tf.range(tf.cast(len_examples, default_float()), dtype=default_float()) / tf.cast(len_examples-1, default_float())
     time_lags = tf.maximum(time[:, None] - lags[None, :], 0.)
 
     X_lags = lin_interp(time, X, time_lags)

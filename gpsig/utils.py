@@ -1,6 +1,5 @@
 import numpy as np
 import tensorflow as tf
-tf.logging.set_verbosity(tf.logging.ERROR)
 import gpflow as gp
 
 def _sample_inducing_tensors(sequences, num_inducing, num_levels, increments):
@@ -90,9 +89,7 @@ def suggest_initial_lengthscales(X, num_samples=None):
     X = X[np.logical_not(np.any(np.isnan(X), axis=1))]
     if num_samples is not None and num_samples < X.shape[0]:
         X = X[np.random.choice(X.shape[0], size=(num_samples), replace=False)]
-    X = tf.convert_to_tensor(X, gp.settings.float_type)
+    X = tf.convert_to_tensor(X, gp.default_float())
     l_init = tf.sqrt(tf.reduce_mean(tf.reshape(tf.square(X)[:, None, :] + tf.square(X)[None, :, :] - 2 * X[:, None, :] * X[None, :, :], [-1, tf.shape(X)[1]]), axis=0)
-                     * tf.cast(X.shape[1], gp.settings.float_type))
-    with tf.Session() as sess:
-        l_init = sess.run(l_init)
-    return np.maximum(l_init, 1.)
+                     * tf.cast(X.shape[1], gp.default_float()))
+    return np.maximum(l_init.numpy(), 1.)
